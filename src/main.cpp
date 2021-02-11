@@ -122,7 +122,10 @@ bool opt_log_file = false;
 
 static mtx_t stats_lock;
 
-
+// Verthash data loading mutex, count, and condition
+mtx_t gMutex;
+int gCount;
+cnd_t gCond;
 
 volatile bool abort_flag = false;
 
@@ -1403,6 +1406,12 @@ static int verthashOpenCL_thread(void *userdata)
         // upload verthash data
         errorCode = clEnqueueWriteBuffer(clCommandQueue, clmemFullDat, CL_TRUE, 0,
                                          verthashInfo.dataSize, verthashInfo.data, 0, nullptr, nullptr);
+        // lock mutex, inc count, broadcast condition
+        mtx_lock(&gMutex);
+        ++gCount;
+        cnd_broadcast(&gCond);
+        mtx_unlock(&gMutex);
+        
         if (errorCode != CL_SUCCESS) { applog(LOG_ERR, "cl_device(%d):Failed to copy Verthash data to the GPU memory.", thr_id); goto out; }
     }
     else
@@ -2045,6 +2054,13 @@ static int verthashCuda_thread(void *userdata)
 
         // upload
         cuerr = cudaMemcpy(dmemFullDat, verthashInfo.data, verthashInfo.dataSize, cudaMemcpyHostToDevice);
+        
+        // lock mutex, inc count, broadcast condition
+        mtx_lock(&gMutex);
+        ++gCount;
+        cnd_broadcast(&gCond);
+        mtx_unlock(&gMutex);
+
         if (cuerr != cudaSuccess) { applog(LOG_ERR, "cu_device(%d):Failed to copy a verthash data to device memory. error code: %d", cuWorkerIndex, cuerr); goto out; }
     }
     else
@@ -3225,6 +3241,8 @@ int utf8_main(int argc, char *argv[])
     mtx_init(&g_work_lock, mtx_plain);
     mtx_init(&stratum.sock_lock, mtx_plain);
     mtx_init(&stratum.work_lock, mtx_plain);
+    mtx_init(&gMutex, mtx_plain);
+    cnd_init(&gCond);
 
     // Enables signal handlers to exit application properly
 #ifndef _WIN32
@@ -3698,6 +3716,8 @@ int utf8_main(int argc, char *argv[])
         
         return 0;
     }
+    
+    mtx_lock(&gMutex);
 
     // device workers
     std::vector<clworker_t> clworkers;
@@ -4644,6 +4664,9 @@ int utf8_main(int argc, char *argv[])
     }
 #endif
 
+    // Initialize gCount
+    gCount = 0;
+
     //-------------------------------------
     // Init cURL
     long flags = opt_benchmark || (strncasecmp(rpc_url, "https://", 8) &&
@@ -4815,6 +4838,21 @@ int utf8_main(int argc, char *argv[])
     }
 #endif
 
+    applog(LOG_INFO, "Waiting for %d thread(s) to load verthash.dat...", opt_n_threads);
+    
+    // Wait until all threads have loaded verthash.dat and then release memory
+    while(gCount < opt_n_threads)
+    {
+      cnd_wait(&gCond, &gMutex);
+    }
+    mtx_unlock(&gMutex);
+
+    applog(LOG_INFO, "Verthash data loaded on %d miners!  Freeing allocated memory...", gCount);
+
+    //-----------------------------------------------------------------------------
+    // Free allocated data
+
+    verthash_info_free(&verthashInfo);
 
     applog(LOG_INFO, "%d miner threads started, using Verthash algorithm.", opt_n_threads);
 
@@ -4855,17 +4893,12 @@ int utf8_main(int argc, char *argv[])
         thrd_join(thr_info[longpoll_thr_id].pth, NULL);
     }
 
-    applog(LOG_INFO, "Freeing allocated memory...");
-
-    //-----------------------------------------------------------------------------
-    // Free allocated data
-    verthash_info_free(&verthashInfo);
-
     // queues
     tq_free(thr_info[work_thr_id].q);
     for (size_t i = 0; i < opt_n_threads; ++i) { tq_free(thr_info[i].q); }
     if (have_stratum) { tq_free(thr_info[stratum_thr_id].q); }
     else if (want_longpoll) { tq_free(thr_info[longpoll_thr_id].q); }
+
 
     applog(LOG_INFO, "Application has been exited gracefully.");
 
